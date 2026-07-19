@@ -948,6 +948,93 @@ function ajaxResponse($status = 0, $message = "", $data = array())
 |
 | @return	string/boolean	Path and filename of the new image or FALSE if there were some error
 */
+
+// Strips active content from an SVG file in-place using DOMDocument.
+// Removes <script>, <foreignObject>, on* event attributes, javascript: URIs,
+// and <use> elements with external hrefs. Returns false if the file cannot be
+// parsed as valid XML, so callers should treat false as a rejection.
+function sanitizeSVG($file)
+{
+	$content = file_get_contents($file);
+	if ($content === false) {
+		return false;
+	}
+
+	$dom = new DOMDocument();
+	$previousLibxmlErrors = libxml_use_internal_errors(true);
+	$loaded = $dom->loadXML($content);
+	libxml_clear_errors();
+	libxml_use_internal_errors($previousLibxmlErrors);
+	if (!$loaded) {
+		return false;
+	}
+
+	// Reject any document with a DOCTYPE. Entity definitions would otherwise
+	// survive into the output, and content entity references are not expanded
+	// into the DOM — so the XPath filters never see them and a downstream
+	// parser could reintroduce active content (XXE / entity expansion).
+	if ($dom->doctype !== null) {
+		return false;
+	}
+
+	$xpath = new DOMXPath($dom);
+
+	// Remove <script> elements. Use local-name() so namespaced SVG elements
+	// (xmlns="http://www.w3.org/2000/svg") are matched too.
+	foreach (iterator_to_array($xpath->query('//*[local-name()="script"]')) as $node) {
+		$node->parentNode->removeChild($node);
+	}
+
+	// Remove <foreignObject> — can embed arbitrary HTML (namespace-agnostic).
+	foreach (iterator_to_array($xpath->query('//*[local-name()="foreignObject"]')) as $node) {
+		$node->parentNode->removeChild($node);
+	}
+
+	// Remove on* event attributes and javascript: URIs from every element.
+	// Collect the attribute nodes (not their names) and remove them with
+	// removeAttributeNode() so namespaced attributes such as xlink:href are
+	// handled — removeAttribute('href') cannot match a prefixed attribute,
+	// and PHP reports their ->name as the bare local name anyway.
+	foreach ($xpath->query('//*') as $element) {
+		$toRemove = array();
+		foreach ($element->attributes as $attr) {
+			$name  = strtolower($attr->localName);
+			// Strip control characters/whitespace before the scheme check —
+			// browsers ignore them, so "java&#x0A;script:" would otherwise
+			// slip past a plain strpos('javascript:').
+			$value = strtolower(preg_replace('/[\x00-\x20\x7f]+/', '', $attr->value));
+			if (strpos($name, 'on') === 0) {
+				$toRemove[] = $attr;
+			} elseif (in_array($name, array('href', 'action', 'formaction', 'src'), true)
+				&& strpos($value, 'javascript:') !== false) {
+				$toRemove[] = $attr;
+			}
+		}
+		foreach ($toRemove as $attrNode) {
+			$element->removeAttributeNode($attrNode);
+		}
+	}
+
+	// Remove <use> elements that reference external documents (namespace-agnostic).
+	foreach (iterator_to_array($xpath->query('//*[local-name()="use"]')) as $node) {
+		$href = $node->getAttribute('href');
+		if (empty($href)) {
+			$href = $node->getAttributeNS('http://www.w3.org/1999/xlink', 'href');
+		}
+		// Only allow same-document fragment references (#id).
+		if (!empty($href) && strpos($href, '#') !== 0) {
+			$node->parentNode->removeChild($node);
+		}
+	}
+
+	$sanitized = $dom->saveXML();
+	if ($sanitized === false) {
+		return false;
+	}
+
+	return file_put_contents($file, $sanitized) !== false;
+}
+
 function transformImage($file, $imageDir, $thumbnailDir = false)
 {
   global $site;
@@ -983,6 +1070,15 @@ function transformImage($file, $imageDir, $thumbnailDir = false)
   $image = $imageDir . $nextFilename;
   Filesystem::mv($file, $image);
   chmod($image, 0644);
+
+  // Sanitize SVG files to remove active content before storage.
+  if ($fileExtension === 'svg') {
+    if (sanitizeSVG($image) === false) {
+      Log::set('SVG sanitization failed (invalid XML), rejecting file: ' . $image, LOG_TYPE_ERROR);
+      @unlink($image);
+      return false;
+    }
+  }
 
   // Generate Thumbnail
   if (!empty($thumbnailDir) && $site->thumbnailEnable()) {
